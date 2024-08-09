@@ -1,0 +1,6 @@
+{
+  "appId": "someappid",
+  "displayName": "sp-diplay-name",
+  "password": "superstrongpassword",
+  "tenant": "tenantid"
+}

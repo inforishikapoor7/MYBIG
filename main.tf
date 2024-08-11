@@ -1,157 +1,161 @@
-resource "azurerm_resource_group" "rg" {
-  location = var.resource_group_location
-  name     = "${random_pet.prefix.id}-rg"
+data "http" "public_ip" {
+  url = "https://api.ipify.org"
 }
 
-# Create virtual network
-resource "azurerm_virtual_network" "my_terraform_network" {
-  name                = "${random_pet.prefix.id}-vnet"
-  address_space       = ["10.0.0.0/16"]
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
+locals {
+  // Clean and set the public IP address
+  public_ip = chomp(data.http.public_ip.response_body)
+
+  // use public IP with /32 
+  authorized_ip_range = ["${local.public_ip}/32"]
 }
 
-# Create subnet
-resource "azurerm_subnet" "my_terraform_subnet" {
-  name                 = "${random_pet.prefix.id}-subnet"
-  resource_group_name  = azurerm_resource_group.rg.name
-  virtual_network_name = azurerm_virtual_network.my_terraform_network.name
-  address_prefixes     = ["10.0.1.0/24"]
+data "azurerm_resource_group" "vm-rg" {
+  name = var.vm_rg
 }
 
-# Create public IPs
-resource "azurerm_public_ip" "my_terraform_public_ip" {
-  name                = "${random_pet.prefix.id}-public-ip"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
+data "azurerm_resource_group" "vnet-rg" {
+  name = var.vnet_rg
+}
+
+data "azurerm_virtual_network" "vnet" {
+  name                = var.vnet_name
+  resource_group_name = data.azurerm_resource_group.vnet-rg.name
+}
+
+data "azurerm_subnet" "subnet" {
+  name                 = var.subnet_name
+  virtual_network_name = data.azurerm_virtual_network.vnet.name
+  resource_group_name  = data.azurerm_resource_group.vnet-rg.name
+}
+
+resource "azurerm_network_interface" "netinterface" {
+  name                = "${var.vm_name}-nic"
+  location            = var.region
+  resource_group_name = var.vnet_rg
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = data.azurerm_subnet.subnet.id
+    private_ip_address_allocation = "Dynamic"
+    // Not needed when using a VPN or Bastion 
+    public_ip_address_id = azurerm_public_ip.public_ip.id
+  }
+}
+
+resource "azurerm_public_ip" "public_ip" {
+  name                = "vm_public_ip"
+  resource_group_name = data.azurerm_resource_group.vm-rg.name
+  location            = data.azurerm_resource_group.vm-rg.location
   allocation_method   = "Dynamic"
 }
 
-# Create Network Security Group and rules
-resource "azurerm_network_security_group" "my_terraform_nsg" {
-  name                = "${random_pet.prefix.id}-nsg"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
+// NSG
+resource "azurerm_network_security_group" "vm-nsg" {
+  name                = "vm-nsg"
+  location            = var.region
+  resource_group_name = data.azurerm_resource_group.vm-rg.name
+}
 
-  security_rule {
-    name                       = "RDP"
-    priority                   = 1000
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "*"
-    source_port_range          = "*"
-    destination_port_range     = "3389"
-    source_address_prefix      = "*"
-    destination_address_prefix = "*"
+
+// Not needed when using a VPN or Bastion
+// NSG Security RDP rule(s)
+resource "azurerm_network_security_rule" "vm-sec-rule" {
+  access                      = "Allow"
+  destination_address_prefix  = "*"
+  destination_port_range      = "3389"
+  direction                   = "Inbound"
+  name                        = "RDP"
+  network_security_group_name = azurerm_network_security_group.vm-nsg.name
+  priority                    = 100
+  protocol                    = "Tcp"
+  resource_group_name         = data.azurerm_resource_group.vm-rg.name
+  source_address_prefixes     = local.authorized_ip_range
+  source_port_range           = "*"
+  depends_on = [
+    azurerm_network_security_group.vm-nsg,
+  ]
+}
+
+// Connect security group to NIC
+resource "azurerm_network_interface_security_group_association" "nsg-connect" {
+  network_interface_id      = azurerm_network_interface.netinterface.id
+  network_security_group_id = azurerm_network_security_group.vm-nsg.id
+}
+
+// Create VM
+resource "azurerm_windows_virtual_machine" "vm" {
+  admin_username = var.vm_username
+  admin_password = var.vm_password
+  location       = var.region
+  name           = var.vm_name
+  network_interface_ids = [
+    azurerm_network_interface.netinterface.id
+  ]
+  resource_group_name = var.vm_rg
+  secure_boot_enabled = true
+  size                = var.vm_size
+  tags = {
+    Environment = var.tag_environment
   }
-  security_rule {
-    name                       = "web"
-    priority                   = 1001
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "80"
-    source_address_prefix      = "*"
-    destination_address_prefix = "*"
-  }
-}
-
-# Create network interface
-resource "azurerm_network_interface" "my_terraform_nic" {
-  name                = "${random_pet.prefix.id}-nic"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-
-  ip_configuration {
-    name                          = "my_nic_configuration"
-    subnet_id                     = azurerm_subnet.my_terraform_subnet.id
-    private_ip_address_allocation = "Dynamic"
-    public_ip_address_id          = azurerm_public_ip.my_terraform_public_ip.id
-  }
-}
-
-# Connect the security group to the network interface
-resource "azurerm_network_interface_security_group_association" "example" {
-  network_interface_id      = azurerm_network_interface.my_terraform_nic.id
-  network_security_group_id = azurerm_network_security_group.my_terraform_nsg.id
-}
-
-# Create storage account for boot diagnostics
-resource "azurerm_storage_account" "my_storage_account" {
-  name                     = "diag${random_id.random_id.hex}"
-  location                 = azurerm_resource_group.rg.location
-  resource_group_name      = azurerm_resource_group.rg.name
-  account_tier             = "Standard"
-  account_replication_type = "LRS"
-}
-
-
-# Create virtual machine
-resource "azurerm_windows_virtual_machine" "main" {
-  name                  = "${var.prefix}-vm"
-  admin_username        = "azureuser"
-  admin_password        = random_password.password.result
-  location              = azurerm_resource_group.rg.location
-  resource_group_name   = azurerm_resource_group.rg.name
-  network_interface_ids = [azurerm_network_interface.my_terraform_nic.id]
-  size                  = "Standard_DS1_v2"
+  timezone     = var.vm_timezone
+  vtpm_enabled = true
 
   os_disk {
-    name                 = "myOsDisk"
     caching              = "ReadWrite"
-    storage_account_type = "Premium_LRS"
+    storage_account_type = var.vm_storage
   }
 
   source_image_reference {
-    publisher = "MicrosoftWindowsServer"
-    offer     = "WindowsServer"
-    sku       = "2022-datacenter-azure-edition"
+    offer     = var.offer
+    publisher = var.publisher
+    sku       = var.sku
     version   = "latest"
-  }
-
-
-  boot_diagnostics {
-    storage_account_uri = azurerm_storage_account.my_storage_account.primary_blob_endpoint
   }
 }
 
-# Install IIS web server to the virtual machine
-resource "azurerm_virtual_machine_extension" "web_server_install" {
-  name                       = "${random_pet.prefix.id}-wsi"
-  virtual_machine_id         = azurerm_windows_virtual_machine.main.id
+// https://learn.microsoft.com/en-us/azure/virtual-machines/extensions/custom-script-windows
+resource "azurerm_virtual_machine_extension" "vmextension" {
+  name                       = "post_install"
+  virtual_machine_id         = azurerm_windows_virtual_machine.vm.id
   publisher                  = "Microsoft.Compute"
   type                       = "CustomScriptExtension"
-  type_handler_version       = "1.8"
-  auto_upgrade_minor_version = true
+  type_handler_version       = "1.9"
+  auto_upgrade_minor_version = "true"
+
+  protected_settings = <<PROTECTED_SETTINGS
+    {
+       "commandToExecute": "powershell -ExecutionPolicy Unrestricted -file post_install.ps1 -EnableCredSSP -DisableBasicAuth"
+    }
+  PROTECTED_SETTINGS
 
   settings = <<SETTINGS
     {
-      "commandToExecute": "powershell -ExecutionPolicy Unrestricted Install-WindowsFeature -Name Web-Server -IncludeAllSubFeature -IncludeManagementTools"
+      "fileUris": [
+        "${var.file_uris}"
+        ]
     }
   SETTINGS
 }
 
-# Generate random text for a unique storage account name
-resource "random_id" "random_id" {
-  keepers = {
-    # Generate a new ID only when a new resource group is defined
-    resource_group = azurerm_resource_group.rg.name
+// Shutdown the VM
+resource "azurerm_dev_test_global_vm_shutdown_schedule" "vmshutdown" {
+  daily_recurrence_time = var.vm_shutdown
+  location              = var.region
+  timezone              = var.vm_timezone
+  virtual_machine_id    = azurerm_windows_virtual_machine.vm.id
+  notification_settings {
+    enabled = false
   }
-
-  byte_length = 8
+  depends_on = [
+    azurerm_windows_virtual_machine.vm,
+  ]
 }
 
-resource "random_password" "password" {
-  length      = 20
-  min_lower   = 1
-  min_upper   = 1
-  min_numeric = 1
-  min_special = 1
-  special     = true
+output "private_ip" {
+  value = azurerm_network_interface.netinterface.private_ip_address
 }
 
-resource "random_pet" "prefix" {
-  prefix = var.prefix
-  length = 1
+output "public_ip" {
+  value = azurerm_windows_virtual_machine.vm.public_ip_address
 }
